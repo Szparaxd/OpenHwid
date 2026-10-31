@@ -1,0 +1,31 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet build OpenHwid.slnx -c Release
+      - run: dotnet run --project tests/OpenHwid.Tests -c Release --no-build
+      - name: Read-only desktop smoke test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $resultPath = Join-Path $PWD 'artifacts/smoke.txt'
+          $app = Start-Process -FilePath ./src/OpenHwid.Windows/bin/Release/net10.0-windows/OpenHwid.exe -ArgumentList '--smoke-test', $resultPath -PassThru -WindowStyle Hidden
+          if (-not $app.WaitForExit(90000)) { $app.Kill($true); throw 'Smoke test timed out' }
+          if ($app.ExitCode -ne 0) { throw 'Smoke test failed' }
+          if (-not (Test-Path $resultPath)) { throw 'No smoke test result' }
+          Get-Content $resultPath
+      - run: dotnet publish src/OpenHwid.Windows -c Release -r win-x64 --self-contained true -o artifacts/win-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OpenHwid-win-x64
+          path: artifacts/win-x64/

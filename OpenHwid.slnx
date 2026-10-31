@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/OpenHwid.Core/OpenHwid.Core.csproj" />
+    <Project Path="src/OpenHwid.Windows/OpenHwid.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OpenHwid.Tests/OpenHwid.Tests.csproj" />
+  </Folder>
+</Solution>
