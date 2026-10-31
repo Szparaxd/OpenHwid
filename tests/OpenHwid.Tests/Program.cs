@@ -101,6 +101,122 @@ var tests = new (string Name, Action Run)[]
         var file = Path.Combine(adapter.Directory, "file"); File.WriteAllText(file, "occupied");
         var bad = new MacService(adapter, new BackupStore(file), "test-machine");
         Throws<IOException>(() => bad.Change(adapter.Id, "02AABBCCDDEE")); Equal(0, adapter.Writes);
+    })),
+    ("Report comparison ignores capture time and device order", () =>
+    {
+        var a = """{"SchemaVersion":1,"CapturedAtUtc":"2026-01-01","Network":[{"GUID":"a","MACAddress":"02AA"},{"GUID":"b","MACAddress":"02BB"}],"Warnings":[]}""";
+        var b = """{"Warnings":[],"Network":[{"MACAddress":"02BB","GUID":"b"},{"MACAddress":"02AA","GUID":"a"}],"CapturedAtUtc":"2026-02-02","SchemaVersion":1}""";
+        Equal(0, ReportComparer.Compare(a, b).Count);
+    }),
+    ("Report comparison locates changed MAC by GUID", () =>
+    {
+        var a = """{"SchemaVersion":1,"Network":[{"GUID":"a","MACAddress":"001122334455"},{"GUID":"b","MACAddress":"006677889900"}]}""";
+        var b = """{"SchemaVersion":1,"Network":[{"GUID":"b","MACAddress":"006677889900"},{"GUID":"a","MACAddress":"02AABBCCDDEE"}]}""";
+        var diff = ReportComparer.Compare(a, b).Single();
+        Equal(new ReportDifference("Network", "a", "MACAddress", "001122334455", "02AABBCCDDEE", "Changed"), diff);
+    }),
+    ("Report comparison detects added and removed devices", () =>
+    {
+        var a = """{"SchemaVersion":1,"Volumes":[{"DeviceID":"C:","VolumeSerialNumber":"AAA"}]}""";
+        var b = """{"SchemaVersion":1,"Volumes":[{"DeviceID":"D:","VolumeSerialNumber":"BBB"}]}""";
+        var diff = ReportComparer.Compare(a, b);
+        Equal(2, diff.Count); Equal("Removed", diff.Single(d => d.Device == "C:").Kind); Equal("Added", diff.Single(d => d.Device == "D:").Kind);
+    }),
+    ("Unidentified virtual adapter does not hide a physical adapter MAC change", () =>
+    {
+        var a = """{"SchemaVersion":1,"Network":[{"GUID":null,"Name":"Virtual"},{"GUID":"physical","MACAddress":"old"}]}""";
+        var b = """{"SchemaVersion":1,"Network":[{"GUID":"physical","MACAddress":"new"},{"GUID":null,"Name":"Virtual"}]}""";
+        var diff = ReportComparer.Compare(a, b).Single(); Equal("physical", diff.Device); Equal("MACAddress", diff.Property);
+    }),
+    ("Singleton hardware values compare by property", () =>
+    {
+        var diff = ReportComparer.Compare("""{"SchemaVersion":1,"Computer":[{"UUID":"old"}]}""", """{"SchemaVersion":1,"Computer":[{"UUID":"new"}]}""").Single();
+        Equal("UUID", diff.Property); Equal("old", diff.Before); Equal("new", diff.After);
+    }),
+    ("Unkeyed duplicate devices compare as unordered sets", () =>
+    {
+        var a = """{"SchemaVersion":1,"Disks":[{"Model":"same","SerialNumber":"x"},{"SerialNumber":"y","Model":"same"}]}""";
+        var b = """{"SchemaVersion":1,"Disks":[{"Model":"same","SerialNumber":"y"},{"SerialNumber":"x","Model":"same"}]}""";
+        Equal(0, ReportComparer.Compare(a, b).Count);
+    }),
+    ("Duplicate and null device keys use aggregate comparison", () =>
+    {
+        foreach (var key in new[] { "\"same\"", "null" })
+        {
+            var a = "{\"SchemaVersion\":1,\"Network\":[{\"GUID\":" + key + ",\"MACAddress\":\"old\"},{\"GUID\":" + key + ",\"MACAddress\":\"second\"}]}";
+            var b = a.Replace("old", "new");
+            var diff = ReportComparer.Compare(a, b).Single(); Equal("Changed", diff.Kind);
+            using var group = System.Text.Json.JsonDocument.Parse(diff.Before!); Equal(2, group.RootElement.GetArrayLength());
+        }
+    }),
+    ("Partial query failure is unavailable rather than hardware removal", () =>
+    {
+        var a = """{"SchemaVersion":1,"Disks":[{"Model":"disk"}]}""";
+        var b = """{"SchemaVersion":1,"Disks":[],"Warnings":["Win32_DiskDrive: Access denied"]}""";
+        Equal("Unavailable", ReportComparer.Compare(a, b).Single().Kind);
+    }),
+    ("Missing category is unavailable rather than removal", () =>
+    {
+        var a = """{"SchemaVersion":1,"Disks":[{"Model":"disk"}],"Network":[]}""";
+        var b = """{"SchemaVersion":1,"Network":[]}""";
+        Equal("Unavailable", ReportComparer.Compare(a, b).Single().Kind);
+    }),
+    ("Comparison rejects invalid report schema and shape", () =>
+    {
+        var valid = """{"SchemaVersion":1,"Network":[]}""";
+        foreach (var bad in new[] { "{}", "[]", "null", "{\"SchemaVersion\":\"1\",\"Network\":[]}", "{\"SchemaVersion\":2,\"Network\":[]}", "{\"SchemaVersion\":1,\"Network\":\"bad\"}", "{\"SchemaVersion\":1,\"Network\":[null]}" })
+            Throws<InvalidDataException>(() => ReportComparer.Compare(bad, valid));
+    }),
+    ("Profile save normalizes MAC and persists across instances", () => WithDirectory(dir =>
+    {
+        var store = new ProfileStore(dir); var profile = store.Save("  Laboratorium  ", "02:aa:bb:cc:dd:ee");
+        var saved = new ProfileStore(dir).List().Single(); Equal(profile, saved); Equal("Laboratorium", saved.Name); Equal("02AABBCCDDEE", saved.Mac);
+    })),
+    ("Profile validation rejects bad input without writing files", () => WithDirectory(dir =>
+    {
+        var store = new ProfileStore(dir);
+        foreach (var name in new[] { "", " ", "bad\nname", new string('a', 65) }) Throws<ArgumentException>(() => store.Save(name, "02AABBCCDDEE"));
+        Throws<ArgumentException>(() => store.Save("bad mac", "01AABBCCDDEE")); Equal(0, Directory.GetFiles(dir).Length);
+    })),
+    ("Duplicate profile names cannot overwrite existing MAC", () => WithDirectory(dir =>
+    {
+        var store = new ProfileStore(dir); store.Save("QA", "02AABBCCDDEE");
+        Throws<InvalidOperationException>(() => store.Save("qa", "061122334455")); Equal("02AABBCCDDEE", store.List().Single().Mac);
+    })),
+    ("Deleting a profile preserves other profiles", () => WithDirectory(dir =>
+    {
+        var store = new ProfileStore(dir); var a = store.Save("A", "02AABBCCDDEE"); var b = store.Save("B", "061122334455");
+        store.Delete(a.Id); Equal(b, store.List().Single());
+    })),
+    ("Profile name cannot escape storage directory", () => WithDirectory(dir =>
+    {
+        var store = new ProfileStore(dir); var profile = store.Save("../outside", "02AABBCCDDEE");
+        Equal(profile.Id.ToString("N") + ".json", Path.GetFileName(Directory.GetFiles(dir).Single()));
+    })),
+    ("Corrupt profile blocks writes and is retained", () => WithDirectory(dir =>
+    {
+        var file = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".json"); File.WriteAllText(file, "corrupt");
+        Throws<InvalidDataException>(() => new ProfileStore(dir).Save("QA", "02AABBCCDDEE")); Equal("corrupt", File.ReadAllText(file));
+    })),
+    ("Profile content identity must match its filename", () => WithDirectory(dir =>
+    {
+        File.WriteAllText(Path.Combine(dir, Guid.NewGuid().ToString("N") + ".json"), System.Text.Json.JsonSerializer.Serialize(new MacProfile(1, Guid.NewGuid(), "QA", "02AABBCCDDEE", DateTimeOffset.UtcNow)));
+        Throws<InvalidDataException>(() => new ProfileStore(dir).List());
+    })),
+    ("Profile missing required fields is rejected", () => WithDirectory(dir =>
+    {
+        File.WriteAllText(Path.Combine(dir, Guid.NewGuid().ToString("N") + ".json"), "{\"Version\":1}");
+        Throws<InvalidDataException>(() => new ProfileStore(dir).List());
+    })),
+    ("Oversized profile is rejected without modification", () => WithDirectory(dir =>
+    {
+        var path = Path.Combine(dir, Guid.NewGuid().ToString("N") + ".json"); File.WriteAllText(path, new string(' ', 16385));
+        Throws<InvalidDataException>(() => new ProfileStore(dir).List()); Equal(16385L, new FileInfo(path).Length);
+    })),
+    ("Profile save fails without replacing a blocking file", () => WithDirectory(dir =>
+    {
+        var path = Path.Combine(dir, "blocked"); File.WriteAllText(path, "preserve");
+        Throws<IOException>(() => new ProfileStore(path).Save("QA", "02AABBCCDDEE")); Equal("preserve", File.ReadAllText(path));
     }))
 };
 var failed = 0;
@@ -125,6 +241,11 @@ static void WithFixture(Action<FakeAdapter, BackupStore, MacService> action)
     var dir = Path.Combine(Path.GetTempPath(), "OpenHwidTests-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
     try { var adapter = new FakeAdapter(dir); var store = new BackupStore(dir); action(adapter, store, new MacService(adapter, store, "test-machine")); }
     finally { Directory.Delete(dir, true); }
+}
+static void WithDirectory(Action<string> action)
+{
+    var dir = Path.Combine(Path.GetTempPath(), "OpenHwidTests-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(dir);
+    try { action(dir); } finally { Directory.Delete(dir, true); }
 }
 sealed class FakeAdapter(string directory) : IAdapterAccess
 {

@@ -5,11 +5,13 @@ using OpenHwid.Core;
 
 namespace OpenHwid.Windows;
 
-internal sealed class MainForm : Form
+internal sealed partial class MainForm : Form
 {
     private static readonly Color Ink = Color.FromArgb(26, 40, 57);
     private static readonly Color Accent = Color.FromArgb(0, 108, 112);
     private readonly WindowsAdapters adapters = new();
+    private readonly TabControl tabs = new() { Dock = DockStyle.Fill, Padding = new Point(18, 8) };
+    private readonly ProfileStore profileStore;
     private readonly string backupDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenHwid", "backups");
     private readonly DataGridView grid = new();
     private readonly ComboBox adapterBox = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
@@ -27,7 +29,10 @@ internal sealed class MainForm : Form
 
     public MainForm(string? smokeOutput)
     {
-        Text = "OpenHwid · identyfikatory i prywatność";
+        profileStore = new ProfileStore(smokeOutput is null
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenHwid", "profiles")
+            : Path.Combine(Path.GetDirectoryName(smokeOutput)!, "smoke-profiles"));
+        Text = "OpenHwid 0.2 · identyfikatory i prywatność";
         Size = new Size(1080, 800); MinimumSize = new Size(850, 680);
         StartPosition = FormStartPosition.CenterScreen;
         Font = new Font("Segoe UI", 10); ForeColor = Ink; BackColor = Color.FromArgb(245, 247, 250);
@@ -47,7 +52,6 @@ internal sealed class MainForm : Form
         header.Controls.Add(new Label { Text = WindowsAdapters.IsAdministrator ? "●  Administrator" : "●  Podgląd · bez uprawnień administratora", AutoSize = true, ForeColor = Accent, Padding = new Padding(0, 7, 0, 0) }, 1, 1);
         root.Controls.Add(header, 0, 0);
 
-        var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(18, 8) };
         var hardwareTab = new TabPage("Identyfikatory sprzętu") { Padding = new Padding(12), BackColor = Color.White };
         var macTab = new TabPage("Adres MAC i przywracanie") { Padding = new Padding(16), BackColor = Color.White };
         tabs.TabPages.Add(hardwareTab); tabs.TabPages.Add(macTab); root.Controls.Add(tabs, 0, 1); root.Controls.Add(status, 0, 2);
@@ -87,6 +91,8 @@ internal sealed class MainForm : Form
         layout.Controls.Add(new Label { Text = "Zmiana i przywracanie restartują wybraną kartę i przerywają jej połączenie.\nPierwsza kopia ustawień jest zachowywana przy kolejnych zmianach.\nTa wersja nie zmienia UUID SMBIOS ani numerów seryjnych dysków i firmware.", Dock = DockStyle.Fill }, 0, 6);
         layout.Controls.Add(new Label { Text = "Kopia ustawień", AutoSize = true, Font = new Font(Font, FontStyle.Bold) }, 0, 7);
         layout.Controls.Add(backupInfo, 0, 8); macTab.Controls.Add(layout);
+        tabs.TabPages.Add(BuildComparisonTab());
+        tabs.TabPages.Add(BuildProfilesTab(() => tabs.SelectedTab = macTab));
 
         refresh.Click += async (_, _) => await RefreshAsync(); export.Click += (_, _) => ExportReport();
         generate.Click += (_, _) => macBox.Text = MacAddress.Generate();
@@ -109,7 +115,32 @@ internal sealed class MainForm : Form
                     tabs.SelectedIndex = 1; Application.DoEvents();
                     using var networkBitmap = new Bitmap(Width, Height); DrawToBitmap(networkBitmap, new Rectangle(0, 0, Width, Height));
                     networkBitmap.Save(Path.Combine(Path.GetDirectoryName(smokeOutput)!, Path.GetFileNameWithoutExtension(smokeOutput) + "-network.png"));
-                    File.WriteAllText(smokeOutput, $"UI loaded; inventory rows: {grid.Rows.Count}; adapters: {adapterBox.Items.Count}; mutation performed: false", Encoding.UTF8);
+                    baselineReport = report; UpdateComparison();
+                    if (differences.Count != 0) throw new InvalidOperationException("Comparing the same report produced differences.");
+                    var sample = System.Text.Json.Nodes.JsonNode.Parse(report)!;
+                    var sampleAdapter = sample["Network"]!.AsArray().OfType<System.Text.Json.Nodes.JsonObject>()
+                        .FirstOrDefault(n => !string.IsNullOrEmpty(n["GUID"]?.ToString()) && !string.IsNullOrEmpty(n["MACAddress"]?.ToString()));
+                    if (sampleAdapter is not null)
+                    {
+                        sampleAdapter["MACAddress"] = sampleAdapter["MACAddress"]!.ToString() == "02AABBCCDDEE" ? "061122334455" : "02AABBCCDDEE";
+                        baselineReport = sample.ToJsonString(); baselineLabel.Text = "Baza: raport testowy (symulowana zmiana MAC)";
+                        UpdateComparison();
+                        if (differences.Count != 1 || differences[0].Property != "MACAddress") throw new InvalidOperationException("The simulated MAC difference did not populate the UI.");
+                    }
+                    tabs.SelectedIndex = 2; Application.DoEvents();
+                    SaveSmokeImage(smokeOutput, "comparison");
+                    profileName.Text = "Smoke " + Guid.NewGuid().ToString("N")[..8]; profileMac.Text = "02AABBCCDDEE";
+                    var testProfile = SaveProfile();
+                    try
+                    {
+                        if (profileGrid.Rows.Count == 0 || testProfile.Mac != "02AABBCCDDEE") throw new InvalidOperationException("Profile did not populate the UI.");
+                        tabs.SelectedIndex = 3; Application.DoEvents();
+                        loadProfile.PerformClick();
+                        if (macBox.Text != testProfile.Mac) throw new InvalidOperationException("Loading a profile did not populate the MAC editor.");
+                        tabs.SelectedIndex = 3; Application.DoEvents(); SaveSmokeImage(smokeOutput, "profiles");
+                    }
+                    finally { profileStore.Delete(testProfile.Id); }
+                    File.WriteAllText(smokeOutput, $"UI loaded; inventory rows: {grid.Rows.Count}; adapters: {adapterBox.Items.Count}; comparison and profile UI passed; network mutation performed: false", Encoding.UTF8);
                 }
                 catch (Exception ex) { File.WriteAllText(smokeOutput, ex.ToString()); Environment.ExitCode = 1; }
                 Close();
@@ -126,6 +157,7 @@ internal sealed class MainForm : Form
     };
     private void UpdateActions()
     {
+        UpdateFeatureActions();
         var selected = adapterBox.SelectedItem as NetworkAdapter;
         refresh.Enabled = export.Enabled = generate.Enabled = adapterBox.Enabled = macBox.Enabled = !busy;
         export.Enabled &= report is not null;
@@ -169,6 +201,7 @@ internal sealed class MainForm : Form
                 var index = data.Adapters.ToList().FindIndex(a => a.Id == selectedId); adapterBox.SelectedIndex = Math.Max(0, index);
             }
             var warnings = doc.RootElement.GetProperty("Warnings").GetArrayLength();
+            UpdateComparison();
             status.Text = warnings == 0 ? "Gotowe · odczyt lokalny, bez wysyłania danych" : $"Raport częściowy · ostrzeżenia: {warnings}. Szczegóły w tabeli i JSON.";
         }
         catch (Exception ex) { status.Text = "Odczyt nie powiódł się: " + ex.Message; if (showError) ShowError(ex); }

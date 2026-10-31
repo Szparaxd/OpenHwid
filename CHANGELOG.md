@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 — 2026-10-31
+
+- Nazwane lokalne profile MAC: zapis, lista, wczytanie do edytora i usuwanie.
+- Porównanie bazowego raportu JSON z aktualnym odczytem, z dopasowaniem po GUID/DeviceID.
+- Obsługa dodanych i usuniętych urządzeń oraz niepełnych odczytów.
+- Eksport różnic wraz z oboma raportami.
+- Klucze `DeviceID` CPU i dysków w nowych raportach schematu 1.
+- Testy porównania i profili oraz sprawdzenie nowych zakładek w teście uruchomienia.
+
 ## 0.1.0 — 2026-10-31
 
 - Polski interfejs Windows do odczytu identyfikatorów sprzętu przez CIM.
